@@ -3,7 +3,11 @@ using System.Text;
 
 namespace HuffmanCode;
 
-public readonly record struct FileProgress(string Stage, long ProcessedBytes, long TotalBytes);
+public readonly record struct FileProgress(string Stage, long ProcessedBytes, long TotalBytes)
+{
+    /// <summary>Current output size, including the HFF header, when available.</summary>
+    public long? CurrentOutputBytes { get; init; }
+}
 
 /// <summary>Streaming Huffman encoding for arbitrary binary files.</summary>
 public static class HuffmanFileCodec
@@ -58,9 +62,10 @@ public static class HuffmanFileCodec
                 writer.Write(frequencies[symbol]);
             }
             writer.Write(checksum);
+            long headerSize = output.Position;
             BitWriter bits = new(output);
             processed = 0;
-            progress?.Invoke(new("Encoding", 0, length));
+            progress?.Invoke(new FileProgress("Encoding", 0, length) { CurrentOutputBytes = headerSize });
             while ((read = input.Read(buffer)) > 0)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -68,7 +73,10 @@ public static class HuffmanFileCodec
                     bits.Write(codes[buffer[i]] ?? throw new IOException("The input file changed during encoding."));
                 hash.AppendData(buffer, 0, read);
                 processed += read;
-                progress?.Invoke(new("Encoding", processed, length));
+                progress?.Invoke(new FileProgress("Encoding", processed, length)
+                {
+                    CurrentOutputBytes = headerSize + bits.CurrentByteCount
+                });
             }
             bits.Complete();
             if (processed != length || !CryptographicOperations.FixedTimeEquals(checksum, hash.GetHashAndReset()))
@@ -214,8 +222,11 @@ public static class HuffmanFileCodec
         private int count;
         private int current;
         private int bitCount;
+        private long bytesAdded;
 
         public BitWriter(Stream stream) => this.stream = stream;
+
+        public long CurrentByteCount => bytesAdded + (bitCount > 0 ? 1 : 0);
 
         public void Write(byte[] code)
         {
@@ -239,6 +250,7 @@ public static class HuffmanFileCodec
 
         private void AddByte(byte value)
         {
+            bytesAdded++;
             buffer[count++] = value;
             if (count == buffer.Length)
             {

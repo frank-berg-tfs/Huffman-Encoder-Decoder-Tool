@@ -100,7 +100,12 @@ internal sealed class ConsoleProgress
         if (!changed && !done && timer.ElapsedMilliseconds - lastUpdate < 200)
             return;
         double percentage = 100.0 * progress.ProcessedBytes / progress.TotalBytes;
-        string message = $"{progress.Stage}: {percentage,6:F1}% ({progress.ProcessedBytes:N0}/{progress.TotalBytes:N0} bytes)";
+        string message = $"{progress.Stage}: {percentage:F1}% - {progress.ProcessedBytes:N0} bytes read";
+        if (progress.Stage == "Encoding" && progress.CurrentOutputBytes is long outputBytes)
+        {
+            if (progress.ProcessedBytes > 0)
+                message += $", current output ratio: {100.0 * outputBytes / progress.ProcessedBytes:F1}%";
+        }
         if (Console.IsErrorRedirected)
         {
             if (changed || done)

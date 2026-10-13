@@ -23,7 +23,7 @@ Decode a `.hff` file (the output defaults to the input name without `.hff`):
 dotnet run --project HuffmanCode.Cli -- decode .\archive.zip.hff
 ```
 
-An output path can be supplied as the last argument. Encoding appends `.hff` if the supplied path does not already have that suffix. Existing files are never overwritten. The tool shows progress for files of at least 1 MiB, reports the encoded size as a percentage of the original, and handles Ctrl+C by deleting an incomplete output.
+An output path can be supplied as the last argument. Encoding appends `.hff` if the supplied path does not already have that suffix. Existing files are never overwritten. For files of at least 1 MiB, progress includes the current encoded size and its ratio to the input processed so far; after encoding, the tool reports the final ratio to the complete original file. Ctrl+C deletes an incomplete output.
 
 The binary format starts with the magic bytes `HFF` and a format version, then stores the original size, byte-frequency table, SHA-256 checksum, and Huffman payload. Decoding checks the header, payload, padding, frequency table, and checksum; on an error it removes the partially written output.
 
