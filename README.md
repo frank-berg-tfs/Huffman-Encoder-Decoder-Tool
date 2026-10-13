@@ -17,6 +17,12 @@ Encode a file (the output defaults to `<input>.hff`):
 dotnet run --project HuffmanCode.Cli -- encode .\archive.zip
 ```
 
+The encode command uses half the available logical processors (at least one) and 2 MiB blocks by default. Set the block size in MiB; decimal values are supported:
+
+```powershell
+dotnet run --project HuffmanCode.Cli -- encode .\archive.zip --workers 4 --block-size 0.5
+```
+
 Decode a `.hff` file (the output defaults to the input name without `.hff`):
 
 ```powershell

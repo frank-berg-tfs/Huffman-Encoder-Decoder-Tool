@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks.Dataflow;
 
 namespace HuffmanCode;
 
@@ -13,12 +14,24 @@ public readonly record struct FileProgress(string Stage, long ProcessedBytes, lo
 public static class HuffmanFileCodec
 {
     private const int BufferSize = 64 * 1024;
+    public const int DefaultBlockSize = 2 * 1024 * 1024;
+    public static int DefaultWorkerCount => Math.Clamp((Environment.ProcessorCount + 1) / 2, 1, 64);
     private const byte MagicByte = 0x48;
     private const byte FormatVersion = 1;
 
     public static void EncodeFile(string inputPath, string outputPath,
         Action<FileProgress>? progress = null, CancellationToken cancellationToken = default)
+        => EncodeFile(inputPath, outputPath, DefaultWorkerCount, DefaultBlockSize,
+            progress, cancellationToken);
+
+    public static void EncodeFile(string inputPath, string outputPath, int workerCount, int blockSize,
+        Action<FileProgress>? progress = null, CancellationToken cancellationToken = default)
     {
+        if (workerCount < 1 || workerCount > 64)
+            throw new ArgumentOutOfRangeException(nameof(workerCount), "Worker count must be between 1 and 64.");
+        if (blockSize < 1 || blockSize > 16 * 1024 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be between 1 byte and 16 MiB.");
+
         using FileStream input = OpenInput(inputPath);
         long[] frequencies = new long[256];
         byte[] buffer = new byte[BufferSize];
@@ -66,24 +79,133 @@ public static class HuffmanFileCodec
             BitWriter bits = new(output);
             processed = 0;
             progress?.Invoke(new FileProgress("Encoding", 0, length) { CurrentOutputBytes = headerSize });
-            while ((read = input.Read(buffer)) > 0)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                for (int i = 0; i < read; i++)
-                    bits.Write(codes[buffer[i]] ?? throw new IOException("The input file changed during encoding."));
-                hash.AppendData(buffer, 0, read);
-                processed += read;
-                progress?.Invoke(new FileProgress("Encoding", processed, length)
-                {
-                    CurrentOutputBytes = headerSize + bits.CurrentByteCount
-                });
-            }
+            EncodeBlocksAsync(input, bits, codes, hash, workerCount, blockSize, headerSize, progress, length,
+                cancellationToken)
+                .GetAwaiter().GetResult();
             bits.Complete();
-            if (processed != length || !CryptographicOperations.FixedTimeEquals(checksum, hash.GetHashAndReset()))
+            if (!CryptographicOperations.FixedTimeEquals(checksum, hash.GetHashAndReset()))
                 throw new IOException("The input file changed during encoding.");
             cancellationToken.ThrowIfCancellationRequested();
         });
     }
+
+    private static async Task EncodeBlocksAsync(FileStream input, BitWriter writer, byte[][] codes,
+        IncrementalHash hash, int workerCount, int blockSize, long headerSize,
+        Action<FileProgress>? progress, long totalBytes,
+        CancellationToken cancellationToken)
+    {
+        using CancellationTokenSource pipelineCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        CancellationToken token = pipelineCancellation.Token;
+        TransformBlock<byte[], EncodedBlock> encoders = new(
+            block => EncodeBlock(block, codes),
+            new ExecutionDataflowBlockOptions
+            {
+                BoundedCapacity = workerCount * 2,
+                CancellationToken = token,
+                EnsureOrdered = true,
+                MaxDegreeOfParallelism = workerCount
+            });
+
+        long processedBytes = 0;
+        async Task ProduceBlocksAsync()
+        {
+            try
+            {
+                while (true)
+                {
+                    byte[]? data = await ReadBlockAsync(input, blockSize, token).ConfigureAwait(false);
+                    if (data is null)
+                        break;
+                    hash.AppendData(data);
+                    if (!await encoders.SendAsync(data, token).ConfigureAwait(false))
+                        throw new InvalidOperationException("The encoder stopped before all input blocks were accepted.");
+                }
+                encoders.Complete();
+            }
+            catch (Exception error)
+            {
+                if (error is not OperationCanceledException)
+                {
+                    try { ((IDataflowBlock)encoders).Fault(error); }
+                    catch (InvalidOperationException) { }
+                }
+                throw;
+            }
+        }
+
+        Task producer = ProduceBlocksAsync();
+        try
+        {
+            while (await encoders.OutputAvailableAsync(token).ConfigureAwait(false))
+            {
+                while (encoders.TryReceive(out EncodedBlock? block))
+                {
+                    writer.Append(block.Payload, block.BitLength);
+                    processedBytes += block.InputLength;
+                    progress?.Invoke(new FileProgress("Encoding", processedBytes, totalBytes)
+                    {
+                        CurrentOutputBytes = headerSize + writer.CurrentByteCount
+                    });
+                }
+            }
+            await producer.ConfigureAwait(false);
+            await encoders.Completion.ConfigureAwait(false);
+        }
+        catch
+        {
+            pipelineCancellation.Cancel();
+            try { await producer.ConfigureAwait(false); } catch { }
+            try { await encoders.Completion.ConfigureAwait(false); } catch { }
+            throw;
+        }
+
+        if (processedBytes != totalBytes)
+            throw new IOException("The input file changed while it was being encoded.");
+    }
+
+    private static async Task<byte[]?> ReadBlockAsync(FileStream input, int blockSize, CancellationToken cancellationToken)
+    {
+        byte[] block = new byte[blockSize];
+        int length = 0;
+        while (length < block.Length)
+        {
+            int read = await input.ReadAsync(block.AsMemory(length), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                break;
+            length += read;
+        }
+        if (length == 0)
+            return null;
+        return length == block.Length ? block : block.AsSpan(0, length).ToArray();
+    }
+
+    private static EncodedBlock EncodeBlock(byte[] block, byte[][] codes)
+    {
+        using MemoryStream payload = new();
+        int current = 0;
+        int bitCount = 0;
+        long totalBits = 0;
+        foreach (byte value in block)
+        {
+            byte[] code = codes[value] ?? throw new IOException("The input file changed during encoding.");
+            foreach (byte bit in code)
+            {
+                current = (current << 1) | bit;
+                totalBits++;
+                if (++bitCount == 8)
+                {
+                    payload.WriteByte((byte)current);
+                    current = bitCount = 0;
+                }
+            }
+        }
+        if (bitCount > 0)
+            payload.WriteByte((byte)(current << (8 - bitCount)));
+        return new EncodedBlock(block.Length, payload.ToArray(), totalBits);
+    }
+
+    private sealed record EncodedBlock(int InputLength, byte[] Payload, long BitLength);
 
     public static void DecodeFile(string inputPath, string outputPath,
         Action<FileProgress>? progress = null, CancellationToken cancellationToken = default)
@@ -228,16 +350,39 @@ public static class HuffmanFileCodec
 
         public long CurrentByteCount => bytesAdded + (bitCount > 0 ? 1 : 0);
 
-        public void Write(byte[] code)
+        public void Append(byte[] packedBits, long bitLength)
         {
-            foreach (byte bit in code)
+            long completeBytes = bitLength / 8;
+            for (long i = 0; i < completeBytes; i++)
+                AppendByte(packedBits[(int)i]);
+
+            int finalBitCount = (int)(bitLength % 8);
+            if (finalBitCount > 0)
             {
-                current = (current << 1) | bit;
-                if (++bitCount == 8)
-                {
-                    AddByte((byte)current);
-                    current = bitCount = 0;
-                }
+                byte finalByte = packedBits[completeBytes];
+                for (int i = 7; i >= 8 - finalBitCount; i--)
+                    AppendBit((finalByte >> i) & 1);
+            }
+        }
+
+        private void AppendByte(byte value)
+        {
+            if (bitCount == 0)
+            {
+                AddByte(value);
+                return;
+            }
+            AddByte((byte)((current << (8 - bitCount)) | (value >> bitCount)));
+            current = value & ((1 << bitCount) - 1);
+        }
+
+        private void AppendBit(int bit)
+        {
+            current = (current << 1) | bit;
+            if (++bitCount == 8)
+            {
+                AddByte((byte)current);
+                current = bitCount = 0;
             }
         }
 
