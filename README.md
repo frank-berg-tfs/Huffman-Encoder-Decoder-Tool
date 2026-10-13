@@ -33,4 +33,8 @@ An output path can be supplied as the last argument. Encoding appends `.hff` if 
 
 The binary format starts with the magic bytes `HFF` and a format version, then stores the original size, byte-frequency table, SHA-256 checksum, and Huffman payload. Decoding checks the header, payload, padding, frequency table, and checksum; on an error it removes the partially written output.
 
+## Attribution
+
+This project builds on the original Huffman encoding implementation by Tristan Endreo in [EndreoT/Huffman-Code](https://github.com/EndreoT/Huffman-Code). The original implementation is distributed under the MIT License. Its copyright notice and license terms are preserved in [LICENSE](LICENSE). This repository extends that implementation with file-based encoding and decoding, the `.hff` format, and the command-line tool.
+
 Resources: https://en.wikipedia.org/wiki/Huffman_coding
